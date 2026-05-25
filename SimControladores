@@ -1,0 +1,891 @@
+%% ============================================================
+% SIMULACIÓN DE CONTROL DIGITAL PARA TÚNEL DE VIENTO
+%
+% Versión actualizada:
+% - Implementación con Tm = 0.020 s
+% - Controladores entregan PWM absoluto [%]
+% - PWM limitado entre 15% y 100%
+% - La planta sigue siendo incremental:
+%
+%       G(z) = Delta altura / Delta PWM
+%
+% - La planta original fue identificada con:
+%
+%       Gz_id = 0.4418 / (z - 0.9942), Tm_id = 0.04 s
+%
+% - Para simular a Tm = 0.02 s se recalcula A_p y B_p
+%   conservando la misma dinámica física y la misma ganancia DC.
+%
+% IMPORTANTE:
+% La planta en lazo abierto conserva la lógica original:
+%
+%       u_la = Delta_PWM_real = 0.04
+%
+%% ============================================================
+
+clc;
+clear;
+close all;
+
+%% ============================================================
+% 1. CONFIGURACIÓN DE TIEMPO
+% ============================================================
+
+Tm = 0.020;          % Tiempo de muestreo de implementación [s]
+t_final = 30;        % Tiempo de simulación [s]
+
+% Límite visual para las gráficas.
+% Ojo: no cambia la simulación ni las métricas; solo limita el eje x.
+t_grafica = 25;      % [s]
+
+t = 0:Tm:t_final;
+N = length(t);
+
+%% ============================================================
+% 2. PLANTA IDENTIFICADA ORIGINAL Y CONVERSIÓN A Tm = 0.02
+% ============================================================
+
+% Modelo identificado originalmente
+Tm_id = 0.040;       % tiempo de muestreo original de identificación [s]
+A_id  = 0.9942;
+B_id  = 0.4418;
+
+% Ganancia DC original
+Kdc_id = B_id / (1 - A_id);
+
+% Conversión del polo discreto al nuevo tiempo de muestreo
+A_p = A_id^(Tm/Tm_id);
+
+% Nuevo B para conservar la misma ganancia DC
+B_p = Kdc_id * (1 - A_p);
+
+% Planta discreta equivalente para Tm = 0.02
+Gz = tf(B_p, [1 -A_p], Tm);
+
+disp('============================================================');
+disp('FUNCIÓN DE TRANSFERENCIA DISCRETA EQUIVALENTE PARA Tm = 0.02');
+disp('============================================================');
+Gz
+
+Kdc_Gz = dcgain(Gz);
+
+fprintf('\n===== PLANTA ORIGINAL =====\n');
+fprintf('Tm_id = %.6f s\n', Tm_id);
+fprintf('A_id  = %.8f\n', A_id);
+fprintf('B_id  = %.8f\n', B_id);
+fprintf('Kdc_id = %.8f\n', Kdc_id);
+
+fprintf('\n===== PLANTA EQUIVALENTE Tm = %.3f s =====\n', Tm);
+fprintf('A_p = %.8f\n', A_p);
+fprintf('B_p = %.8f\n', B_p);
+fprintf('Kdc_Gz = %.8f\n', Kdc_Gz);
+fprintf('Fs = %.2f Hz\n', 1/Tm);
+
+%% ============================================================
+% 3. PUNTO DE OPERACIÓN Y ESCALÓN REAL
+% ============================================================
+
+PWM_base    = 28.65;      % Punto de operación
+PWM_inicial = PWM_base;
+PWM_final   = 28.69;
+
+Delta_PWM_real = PWM_final - PWM_inicial;   % 0.04
+
+% Valor final teórico producido por el escalón real
+yss_teorico = Kdc_Gz * Delta_PWM_real;
+
+% Referencia de altura para los controladores
+r_val = yss_teorico;
+r = r_val * ones(1,N);
+
+fprintf('\n===== ESCALÓN REAL DEL EXPERIMENTO =====\n');
+fprintf('PWM base/inicial = %.6f %%\n', PWM_base);
+fprintf('PWM final        = %.6f %%\n', PWM_final);
+fprintf('Delta PWM real   = %.6f\n', Delta_PWM_real);
+fprintf('Referencia r_val = %.6f cm\n', r_val);
+
+%% ============================================================
+% 4. LÍMITES FÍSICOS DEL PWM ABSOLUTO
+% ============================================================
+
+PWM_MIN = 15.0;       % mínimo físico permitido [%]
+PWM_MAX = 100.0;      % máximo físico permitido [%]
+
+fprintf('\n===== LÍMITES FÍSICOS DEL PWM =====\n');
+fprintf('PWM mínimo permitido = %.2f %%\n', PWM_MIN);
+fprintf('PWM máximo permitido = %.2f %%\n', PWM_MAX);
+
+%% ============================================================
+% 5. PLANTA EN LAZO ABIERTO ANTE ESCALÓN REAL
+% ============================================================
+% NO se daña esta lógica:
+% La planta abierta recibe directamente Delta_PWM_real = 0.04
+
+u_la = Delta_PWM_real * ones(1,N);    % Delta PWM que entra a Gz
+PWM_la = PWM_base + u_la;             % PWM absoluto solo para graficar
+
+[y_la, ~] = lsim(Gz, u_la, t);
+y_la = y_la(:).';
+
+%% ============================================================
+% 6. INICIALIZACIÓN DE VARIABLES
+% ============================================================
+
+y_onoff = zeros(1,N);
+y_P     = zeros(1,N);
+y_PI    = zeros(1,N);
+y_PID   = zeros(1,N);
+y_lead  = zeros(1,N);
+y_lag   = zeros(1,N);
+y_sf    = zeros(1,N);
+
+PWM_onoff = PWM_base * ones(1,N);
+PWM_P     = PWM_base * ones(1,N);
+PWM_PI    = PWM_base * ones(1,N);
+PWM_PID   = PWM_base * ones(1,N);
+PWM_lead  = PWM_base * ones(1,N);
+PWM_lag   = PWM_base * ones(1,N);
+PWM_sf    = PWM_base * ones(1,N);
+
+Delta_PWM_onoff = zeros(1,N);
+Delta_PWM_P     = zeros(1,N);
+Delta_PWM_PI    = zeros(1,N);
+Delta_PWM_PID   = zeros(1,N);
+Delta_PWM_lead  = zeros(1,N);
+Delta_PWM_lag   = zeros(1,N);
+Delta_PWM_sf    = zeros(1,N);
+
+%% ============================================================
+% 7. CONTROL ON-OFF CON PWM ABSOLUTO
+% ============================================================
+
+histeresis = 0.15;   % cm
+
+% Valores físicos de PWM para On-Off
+% Agresivos para acelerar dinámica.
+% Si quieres quedarte cerca del punto de operación, usa por ejemplo:
+% PWM_ON = 30; PWM_OFF = 27;
+PWM_ON  = 40.0;
+PWM_OFF = 18.0;
+
+for k = 2:N
+
+    err = r(k-1) - y_onoff(k-1);
+
+    if err > histeresis
+        pwm_cmd = PWM_ON;
+    elseif err < -histeresis
+        pwm_cmd = PWM_OFF;
+    else
+        pwm_cmd = PWM_onoff(k-1);
+    end
+
+    PWM_onoff(k-1) = saturar_pwm_abs(pwm_cmd, PWM_MIN, PWM_MAX);
+
+    Delta_PWM_onoff(k-1) = PWM_onoff(k-1) - PWM_base;
+
+    y_onoff(k) = A_p*y_onoff(k-1) + B_p*Delta_PWM_onoff(k-1);
+end
+
+PWM_onoff(N) = PWM_onoff(N-1);
+Delta_PWM_onoff(N) = Delta_PWM_onoff(N-1);
+
+%% ============================================================
+% 8. CONTROL PROPORCIONAL P CON PWM ABSOLUTO
+% ============================================================
+
+Kp = 1.35;
+
+for k = 2:N
+
+    err = r(k-1) - y_P(k-1);
+
+    % Control proporcional como corrección alrededor del PWM base
+    pwm_cmd = PWM_base + Kp*err;
+
+    PWM_P(k-1) = saturar_pwm_abs(pwm_cmd, PWM_MIN, PWM_MAX);
+
+    Delta_PWM_P(k-1) = PWM_P(k-1) - PWM_base;
+
+    y_P(k) = A_p*y_P(k-1) + B_p*Delta_PWM_P(k-1);
+end
+
+PWM_P(N) = PWM_P(N-1);
+Delta_PWM_P(N) = Delta_PWM_P(N-1);
+
+%% ============================================================
+% 9. CONTROL PI POSICIONAL CON PWM ABSOLUTO
+% ============================================================
+
+Kp_pi = 0.10;
+Ki_pi = 0.02;
+
+I_pi = 0;
+
+for k = 2:N
+
+    err = r(k-1) - y_PI(k-1);
+
+    I_new = I_pi + err*Tm;
+
+    pwm_unsat = PWM_base + Kp_pi*err + Ki_pi*I_new;
+
+    pwm_sat = saturar_pwm_abs(pwm_unsat, PWM_MIN, PWM_MAX);
+
+    % Back-calculation anti-windup
+    if abs(Ki_pi) > 1e-9
+        I_pi = I_new + (pwm_sat - pwm_unsat)/Ki_pi;
+    else
+        I_pi = I_new;
+    end
+
+    PWM_PI(k-1) = pwm_sat;
+
+    Delta_PWM_PI(k-1) = PWM_PI(k-1) - PWM_base;
+
+    y_PI(k) = A_p*y_PI(k-1) + B_p*Delta_PWM_PI(k-1);
+end
+
+PWM_PI(N) = PWM_PI(N-1);
+Delta_PWM_PI(N) = Delta_PWM_PI(N-1);
+
+%% ============================================================
+% 10. CONTROL PID POSICIONAL CON PWM ABSOLUTO
+% ============================================================
+
+Kp_pid = 0.50;
+Ki_pid = 0.05;
+Kd_pid = 0.0015;
+
+tau_f = 0.05;      % filtro derivativo [s]
+
+I_pid = 0;
+e_prev_pid = 0;
+d_filt = 0;
+
+for k = 2:N
+
+    err = r(k-1) - y_PID(k-1);
+
+    % Derivada filtrada
+    deriv_raw = (err - e_prev_pid)/Tm;
+    alpha = tau_f/(tau_f + Tm);
+    d_filt = alpha*d_filt + (1-alpha)*deriv_raw;
+
+    % Integral
+    I_new = I_pid + err*Tm;
+
+    % PID en forma posicional alrededor del PWM base
+    pwm_unsat = PWM_base ...
+              + Kp_pid*err ...
+              + Ki_pid*I_new ...
+              + Kd_pid*d_filt;
+
+    pwm_sat = saturar_pwm_abs(pwm_unsat, PWM_MIN, PWM_MAX);
+
+    % Back-calculation anti-windup
+    if abs(Ki_pid) > 1e-9
+        I_pid = I_new + (pwm_sat - pwm_unsat)/Ki_pid;
+    else
+        I_pid = I_new;
+    end
+
+    e_prev_pid = err;
+
+    PWM_PID(k-1) = pwm_sat;
+
+    Delta_PWM_PID(k-1) = PWM_PID(k-1) - PWM_base;
+
+    y_PID(k) = A_p*y_PID(k-1) + B_p*Delta_PWM_PID(k-1);
+end
+
+PWM_PID(N) = PWM_PID(N-1);
+Delta_PWM_PID(N) = Delta_PWM_PID(N-1);
+
+%% ============================================================
+% 11. COMPENSADOR DE ADELANTO CON PWM ABSOLUTO
+% ============================================================
+% Usa feedforward del escalón real:
+% PWM_base + Delta_PWM_real
+
+a1_lead = 0.20;
+b0_lead = 0.50;
+b1_lead = -0.20;
+
+e_prev_lead = 0;
+v_prev_lead = 0;
+
+for k = 2:N
+
+    err = r(k-1) - y_lead(k-1);
+
+    % Corrección dinámica del compensador
+    v_cmd = a1_lead*v_prev_lead ...
+          + b0_lead*err ...
+          + b1_lead*e_prev_lead;
+
+    % PWM absoluto aplicado físicamente
+    pwm_cmd = PWM_base + Delta_PWM_real + v_cmd;
+
+    PWM_lead(k-1) = saturar_pwm_abs(pwm_cmd, PWM_MIN, PWM_MAX);
+
+    Delta_PWM_lead(k-1) = PWM_lead(k-1) - PWM_base;
+
+    % Guardar la corrección real aplicada, descontando feedforward
+    v_prev_lead = Delta_PWM_lead(k-1) - Delta_PWM_real;
+
+    e_prev_lead = err;
+
+    y_lead(k) = A_p*y_lead(k-1) + B_p*Delta_PWM_lead(k-1);
+end
+
+PWM_lead(N) = PWM_lead(N-1);
+Delta_PWM_lead(N) = Delta_PWM_lead(N-1);
+
+%% ============================================================
+% 12. COMPENSADOR DE ATRASO CON PWM ABSOLUTO
+% ============================================================
+% También usa feedforward del escalón real.
+
+a1_lag = 0.98;
+b0_lag = 0.15;
+b1_lag = -0.145;
+
+e_prev_lag = 0;
+v_prev_lag = 0;
+
+for k = 2:N
+
+    err = r(k-1) - y_lag(k-1);
+
+    % Corrección dinámica del compensador
+    v_cmd = a1_lag*v_prev_lag ...
+          + b0_lag*err ...
+          + b1_lag*e_prev_lag;
+
+    % PWM absoluto aplicado físicamente
+    pwm_cmd = PWM_base + Delta_PWM_real + v_cmd;
+
+    PWM_lag(k-1) = saturar_pwm_abs(pwm_cmd, PWM_MIN, PWM_MAX);
+
+    Delta_PWM_lag(k-1) = PWM_lag(k-1) - PWM_base;
+
+    % Guardar corrección real aplicada, descontando feedforward
+    v_prev_lag = Delta_PWM_lag(k-1) - Delta_PWM_real;
+
+    e_prev_lag = err;
+
+    y_lag(k) = A_p*y_lag(k-1) + B_p*Delta_PWM_lag(k-1);
+end
+
+PWM_lag(N) = PWM_lag(N-1);
+Delta_PWM_lag(N) = Delta_PWM_lag(N-1);
+
+%% ============================================================
+% 13. REALIMENTACIÓN DE ESTADOS CON PWM ABSOLUTO
+% ============================================================
+% Versión más suave para implementación física.
+%
+% Planta equivalente:
+% x[k+1] = A_p*x[k] + B_p*u[k]
+% y[k]   = x[k]
+%
+% Control:
+% xi[k] = xi[k-1] + Tm*e[k]
+%
+% PWM = PWM_base - Kx*x + Ki_sf*xi
+%
+% Esta versión coincide con la implementación usando:
+%
+% Kx    ≈ 0.21289
+% Ki_sf ≈ 0.13561
+%
+% Polos deseados:
+% [0.97, 0.98]
+%% ============================================================
+
+A = A_p;
+B = B_p;
+C = 1;
+
+A_aug = [A,      0;
+        -Tm*C,   1];
+
+B_aug = [B;
+         0];
+
+% Polos más suaves para implementación física
+polos_deseados = [0.97, 0.98];
+
+K_aug = acker(A_aug, B_aug, polos_deseados);
+
+Kx    = K_aug(1);
+Ki_sf = -K_aug(2);
+
+fprintf('\n===== REALIMENTACIÓN DE ESTADOS SUAVE =====\n');
+fprintf('Polos deseados: %.4f y %.4f\n', polos_deseados(1), polos_deseados(2));
+fprintf('Kx    = %.6f\n', Kx);
+fprintf('Ki_sf = %.6f\n', Ki_sf);
+
+x = 0;
+xi = 0;
+
+for k = 2:N
+
+    err = r(k-1) - y_sf(k-1);
+
+    xi_new = xi + Tm*err;
+
+    % Control de estados como corrección alrededor del PWM base
+    v_cmd = -Kx*x + Ki_sf*xi_new;
+
+    pwm_cmd = PWM_base + v_cmd;
+
+    PWM_sf(k-1) = saturar_pwm_abs(pwm_cmd, PWM_MIN, PWM_MAX);
+
+    Delta_PWM_sf(k-1) = PWM_sf(k-1) - PWM_base;
+
+    % Anti-windup simple:
+    % solo acepta la integral nueva si NO hubo saturación
+    if abs(pwm_cmd - PWM_sf(k-1)) < 1e-6
+        xi = xi_new;
+    end
+
+    % Actualización de la planta incremental
+    x = A*x + B*Delta_PWM_sf(k-1);
+
+    y_sf(k) = C*x;
+end
+
+PWM_sf(N) = PWM_sf(N-1);
+Delta_PWM_sf(N) = Delta_PWM_sf(N-1);
+
+%% ============================================================
+% 14. CÁLCULO DE MÉTRICAS
+% ============================================================
+
+nombres = {'Planta Lazo Abierto Gz', ...
+           'On-Off', ...
+           'Proporcional P', ...
+           'PI', ...
+           'PID', ...
+           'Adelanto Lead', ...
+           'Atraso Lag', ...
+           'Realimentacion Estados'};
+
+sistemas = {y_la, ...
+            y_onoff, ...
+            y_P, ...
+            y_PI, ...
+            y_PID, ...
+            y_lead, ...
+            y_lag, ...
+            y_sf};
+
+fprintf('\n========================================================================\n');
+fprintf('        MÉTRICAS REFERIDAS A r = %.6f cm\n', r_val);
+fprintf('        Simulación con PWM absoluto y Tm = %.3f s\n', Tm);
+fprintf('========================================================================\n');
+fprintf('%-30s | %-10s | %-10s | %-10s | %-10s\n', ...
+        'Sistema', 'Ts5 [s]', 'Tr [s]', 'Mp [%]', 'essp');
+fprintf('------------------------------------------------------------------------\n');
+
+metricas = struct();
+
+for i = 1:length(sistemas)
+
+    [Ts_5, Tr_10_90, Mp, essp, yss_sim] = ...
+        metricas_respuesta(t, sistemas{i}, r_val);
+
+    metricas(i).nombre = nombres{i};
+    metricas(i).Ts_5 = Ts_5;
+    metricas(i).Tr_10_90 = Tr_10_90;
+    metricas(i).Mp = Mp;
+    metricas(i).essp = essp;
+    metricas(i).yss_sim = yss_sim;
+
+    if isnan(Ts_5)
+        Ts_str = sprintf('> %.1f', t(end));
+    else
+        Ts_str = sprintf('%.4f', Ts_5);
+    end
+
+    if isnan(Tr_10_90)
+        Tr_str = 'NaN';
+    else
+        Tr_str = sprintf('%.4f', Tr_10_90);
+    end
+
+    fprintf('%-30s | %-10s | %-10s | %-10.2f | %-10.6f\n', ...
+            nombres{i}, Ts_str, Tr_str, Mp, essp);
+end
+
+fprintf('========================================================================\n\n');
+
+%% ============================================================
+% 15. MÉTRICAS EXCLUSIVAS DE LA PLANTA EN LAZO ABIERTO
+% ============================================================
+
+[Ts_5_Gz, Tr_Gz, Mp_Gz, essp_Gz, yss_sim_Gz] = ...
+    metricas_respuesta(t, y_la, yss_teorico);
+
+fprintf('\n============================================================\n');
+fprintf('MÉTRICAS DE LA RESPUESTA AL ESCALÓN DE LA PLANTA Gz\n');
+fprintf('============================================================\n');
+fprintf('PWM inicial: %.4f\n', PWM_inicial);
+fprintf('PWM final: %.4f\n', PWM_final);
+fprintf('Delta PWM: %.5f\n', Delta_PWM_real);
+fprintf('Ganancia DC de Gz: %.6f\n', Kdc_Gz);
+fprintf('Valor final teorico: %.6f\n', yss_teorico);
+fprintf('Valor final simulado: %.6f\n', yss_sim_Gz);
+fprintf('Tiempo de establecimiento 5%%: %.4f s\n', Ts_5_Gz);
+fprintf('Tiempo de subida 10%%-90%%: %.4f s\n', Tr_Gz);
+fprintf('Maximo sobrepico Mp: %.2f %%\n', Mp_Gz);
+fprintf('Error estado estacionario essp: %.6f\n', essp_Gz);
+
+%% ============================================================
+% 16. VERIFICACIÓN DE PWM ABSOLUTO
+% ============================================================
+
+fprintf('\n===== VERIFICACIÓN DE PWM ABSOLUTO =====\n');
+fprintf('Lazo abierto: min = %.4f %% | max = %.4f %%\n', min(PWM_la),     max(PWM_la));
+fprintf('On-Off:       min = %.4f %% | max = %.4f %%\n', min(PWM_onoff), max(PWM_onoff));
+fprintf('P:            min = %.4f %% | max = %.4f %%\n', min(PWM_P),     max(PWM_P));
+fprintf('PI:           min = %.4f %% | max = %.4f %%\n', min(PWM_PI),    max(PWM_PI));
+fprintf('PID:          min = %.4f %% | max = %.4f %%\n', min(PWM_PID),   max(PWM_PID));
+fprintf('Lead:         min = %.4f %% | max = %.4f %%\n', min(PWM_lead),  max(PWM_lead));
+fprintf('Lag:          min = %.4f %% | max = %.4f %%\n', min(PWM_lag),   max(PWM_lag));
+fprintf('Estados:      min = %.4f %% | max = %.4f %%\n', min(PWM_sf),    max(PWM_sf));
+
+%% ============================================================
+% 17. GRÁFICAS INDIVIDUALES: RESPUESTA + SEÑAL DE CONTROL INCREMENTAL
+% ============================================================
+% Cada controlador se grafica en una figura separada.
+%
+% En la MISMA gráfica se muestra:
+%   - Eje izquierdo:
+%       * Referencia
+%       * Planta en lazo abierto Gz
+%       * Respuesta del controlador
+%   - Eje derecho:
+%       * Señal de control incremental:
+%
+%             Delta PWM = PWM_controlador - PWM_base
+%
+% Se grafica Delta PWM, no PWM absoluto, porque el PWM absoluto cambia
+% alrededor de 28.65% y puede verse casi constante si se grafica en una
+% escala amplia. Delta PWM muestra directamente la acción de control que
+% entra al modelo incremental de la planta.
+%
+% Todas las gráficas se limitan visualmente hasta t_grafica = 25 s.
+
+controladores_nombres = { ...
+    'On-Off', ...
+    'Proporcional P', ...
+    'PI', ...
+    'PID', ...
+    'Adelanto Lead', ...
+    'Atraso Lag', ...
+    'Realimentacion Estados'};
+
+controladores_y = { ...
+    y_onoff, ...
+    y_P, ...
+    y_PI, ...
+    y_PID, ...
+    y_lead, ...
+    y_lag, ...
+    y_sf};
+
+controladores_pwm = { ...
+    PWM_onoff, ...
+    PWM_P, ...
+    PWM_PI, ...
+    PWM_PID, ...
+    PWM_lead, ...
+    PWM_lag, ...
+    PWM_sf};
+
+% Banda del 5% respecto a la referencia
+banda_ref = 0.05 * abs(r_val);
+lim_sup_ref = r_val + banda_ref;
+lim_inf_ref = r_val - banda_ref;
+
+for i = 1:length(controladores_nombres)
+
+    y_ctrl = controladores_y{i};
+    pwm_ctrl = controladores_pwm{i};
+
+    % Señal de control incremental que realmente entra a la planta
+    u_ctrl_delta = pwm_ctrl - PWM_base;
+    u_la_delta   = PWM_la   - PWM_base;
+
+    % Métricas del controlador actual
+    [Ts_5_i, Tr_i, Mp_i, essp_i, yss_i] = ...
+        metricas_respuesta(t, y_ctrl, r_val);
+
+    figure('Name', ['Respuesta + Delta PWM - ', controladores_nombres{i}], ...
+           'Position', [100, 100, 950, 520]);
+
+    %% ------------------ EJE IZQUIERDO: RESPUESTA ------------------
+    yyaxis left
+
+    h_ref = stairs(t, r, 'k--', 'LineWidth', 2);
+    hold on;
+
+    h_la = stairs(t, y_la, ...
+           'Color', [0.5 0.5 0.5], ...
+           'LineStyle', ':', ...
+           'LineWidth', 2.2);
+
+    h_ctrl = stairs(t, y_ctrl, ...
+           'b', ...
+           'LineWidth', 1.8);
+
+    h_5sup = yline(lim_sup_ref, 'r:', '+5%');
+    h_5inf = yline(lim_inf_ref, 'r:', '-5%');
+
+    ylabel('\Delta y [cm]');
+
+    % Ajuste visual del eje izquierdo
+    y_min_resp = min([y_la(:); y_ctrl(:); r(:); lim_inf_ref]);
+    y_max_resp = max([y_la(:); y_ctrl(:); r(:); lim_sup_ref]);
+    margen_resp = 0.10 * max(1e-6, y_max_resp - y_min_resp);
+    ylim([y_min_resp - margen_resp, y_max_resp + margen_resp]);
+
+    %% ------------------ EJE DERECHO: SEÑAL DE CONTROL INCREMENTAL ------------------
+    yyaxis right
+
+    h_u = stairs(t, u_ctrl_delta, ...
+           'Color', [0.85 0.33 0.10], ...
+           'LineWidth', 1.6);
+
+    hold on;
+
+    h_u0 = yline(0, 'k--', '\Delta PWM = 0');
+    h_ureal = yline(Delta_PWM_real, 'k-.', '\Delta PWM real');
+
+    ylabel('Señal de control \Delta PWM [%]');
+
+    % Ajuste automático del eje derecho para que la señal no se vea plana
+    u_min_plot = min([u_ctrl_delta(:); u_la_delta(:); Delta_PWM_real; 0]);
+    u_max_plot = max([u_ctrl_delta(:); u_la_delta(:); Delta_PWM_real; 0]);
+
+    margen_u = 0.10 * max(1e-6, u_max_plot - u_min_plot);
+    ylim([u_min_plot - margen_u, u_max_plot + margen_u]);
+
+    %% ------------------ FORMATO GENERAL ------------------
+    grid on;
+    xlim([0 t_grafica]);
+
+    xlabel('Tiempo [s]');
+    title(sprintf('Respuesta y señal de control incremental - %s', controladores_nombres{i}));
+
+    % Texto con métricas
+    if isnan(Ts_5_i)
+        Ts_txt = sprintf('Ts5 > %.1f s', t(end));
+    else
+        Ts_txt = sprintf('Ts5 = %.3f s', Ts_5_i);
+    end
+
+    if isnan(Tr_i)
+        Tr_txt = 'Tr = NaN';
+    else
+        Tr_txt = sprintf('Tr = %.3f s', Tr_i);
+    end
+
+    txt_metricas = sprintf('%s\n%s\nMp = %.2f %%\nessp = %.5f cm', ...
+                           Ts_txt, Tr_txt, Mp_i, essp_i);
+
+    % El texto se ubica sobre el eje izquierdo
+    yyaxis left
+    x_text = 0.62 * t_grafica;
+    y_text = y_min_resp + 0.15 * (y_max_resp - y_min_resp);
+
+    text(x_text, y_text, txt_metricas, ...
+         'FontSize', 10, ...
+         'BackgroundColor', 'white', ...
+         'EdgeColor', 'black');
+
+    legend([h_ref, h_la, h_ctrl, h_5sup, h_5inf, h_u, h_u0, h_ureal], ...
+           {'Referencia', ...
+            'Planta lazo abierto Gz', ...
+            controladores_nombres{i}, ...
+            '+5%', ...
+            '-5%', ...
+            '\Delta PWM controlador', ...
+            '\Delta PWM = 0', ...
+            '\Delta PWM real'}, ...
+           'Location', 'best');
+
+end
+
+%% ============================================================
+% 18. GRÁFICA PWM ABSOLUTO
+% ============================================================
+
+figure('Name', 'PWM absoluto aplicado');
+
+stairs(t, PWM_la, 'Color', [0.5 0.5 0.5], 'LineStyle', ':', 'LineWidth', 2);
+hold on;
+stairs(t, PWM_onoff, 'r', 'LineWidth', 1.2);
+stairs(t, PWM_P, 'g', 'LineWidth', 1.2);
+stairs(t, PWM_PI, 'b', 'LineWidth', 1.2);
+stairs(t, PWM_PID, 'm', 'LineWidth', 1.2);
+stairs(t, PWM_lead, 'Color', [0.85 0.33 0.1], 'LineWidth', 1.2);
+stairs(t, PWM_lag, 'Color', [0.93 0.69 0.13], 'LineWidth', 1.2);
+stairs(t, PWM_sf, 'c', 'LineWidth', 1.5);
+
+yline(PWM_MIN, 'k:', 'PWM min');
+yline(PWM_MAX, 'k:', 'PWM max');
+yline(PWM_base, 'k--', 'PWM base');
+yline(PWM_final, 'k-.', 'PWM final escalón real');
+
+grid on;
+xlim([0 t_grafica]);
+xlabel('Tiempo [s]');
+ylabel('PWM absoluto [%]');
+title('PWM absoluto aplicado por cada controlador');
+legend('Lazo abierto', ...
+       'On-Off', ...
+       'P', ...
+       'PI', ...
+       'PID', ...
+       'Lead', ...
+       'Lag', ...
+       'Estados', ...
+       'Location', 'best');
+
+%% ============================================================
+% 19. GRÁFICA DELTA PWM APLICADO A LA PLANTA
+% ============================================================
+
+figure('Name', 'Delta PWM aplicado a la planta');
+
+stairs(t, u_la, 'Color', [0.5 0.5 0.5], 'LineStyle', ':', 'LineWidth', 2);
+hold on;
+stairs(t, PWM_onoff - PWM_base, 'r', 'LineWidth', 1.2);
+stairs(t, PWM_P     - PWM_base, 'g', 'LineWidth', 1.2);
+stairs(t, PWM_PI    - PWM_base, 'b', 'LineWidth', 1.2);
+stairs(t, PWM_PID   - PWM_base, 'm', 'LineWidth', 1.2);
+stairs(t, PWM_lead  - PWM_base, 'Color', [0.85 0.33 0.1], 'LineWidth', 1.2);
+stairs(t, PWM_lag   - PWM_base, 'Color', [0.93 0.69 0.13], 'LineWidth', 1.2);
+stairs(t, PWM_sf    - PWM_base, 'c', 'LineWidth', 1.5);
+
+yline(Delta_PWM_real, 'k--', '\Delta PWM real');
+
+grid on;
+xlim([0 t_grafica]);
+xlabel('Tiempo [s]');
+ylabel('\Delta PWM');
+title('\Delta PWM que realmente entra al modelo incremental');
+legend('Lazo abierto', ...
+       'On-Off', ...
+       'P', ...
+       'PI', ...
+       'PID', ...
+       'Lead', ...
+       'Lag', ...
+       'Estados', ...
+       'Location', 'best');
+
+%% ============================================================
+% 20. RESPUESTA INDIVIDUAL DE LA PLANTA Gz
+% ============================================================
+
+figure('Name', 'Respuesta al escalón real de Gz');
+
+stairs(t, y_la, 'b', 'LineWidth', 1.8);
+grid on;
+xlim([0 t_grafica]);
+hold on;
+
+y0_Gz = y_la(1);
+Delta_y_Gz = yss_teorico - y0_Gz;
+
+banda_Gz = 0.05 * abs(Delta_y_Gz);
+lim_sup_Gz = yss_teorico + banda_Gz;
+lim_inf_Gz = yss_teorico - banda_Gz;
+
+yline(yss_teorico, '--', 'Valor final teórico');
+yline(lim_sup_Gz, ':', '+5%');
+yline(lim_inf_Gz, ':', '-5%');
+
+xlabel('Tiempo [s]');
+ylabel('\Delta y [cm]');
+title('Respuesta al escalón real de PWM - Planta Gz');
+legend('Respuesta discreta Gz', ...
+       'Valor final teórico', ...
+       '+5%', ...
+       '-5%', ...
+       'Location', 'best');
+
+%% ============================================================
+% 21. POLOS Y CEROS
+% ============================================================
+
+figure('Name', 'Polos y ceros de Gz');
+pzmap(Gz);
+grid on;
+title('Mapa de polos y ceros de la planta discreta equivalente Tm = 0.02');
+
+%% ============================================================
+% FUNCIONES LOCALES
+%% ============================================================
+
+function pwm_sat = saturar_pwm_abs(pwm_cmd, pwm_min, pwm_max)
+    pwm_sat = max(pwm_min, min(pwm_max, pwm_cmd));
+end
+
+function [Ts_5, Tr_10_90, Mp, essp, yss_sim] = metricas_respuesta(t, y, yss_teorico)
+
+    t = t(:);
+    y = y(:);
+
+    y0 = y(1);
+    yss_sim = y(end);
+
+    Delta_y = yss_teorico - y0;
+
+    banda = 0.05 * abs(Delta_y);
+
+    lim_sup = yss_teorico + banda;
+    lim_inf = yss_teorico - banda;
+
+    idx_fuera = find(y > lim_sup | y < lim_inf);
+
+    if isempty(idx_fuera)
+        Ts_5 = 0;
+    elseif idx_fuera(end) < length(t)
+        Ts_5 = t(idx_fuera(end) + 1);
+    else
+        Ts_5 = NaN;
+    end
+
+    y_10 = y0 + 0.10 * Delta_y;
+    y_90 = y0 + 0.90 * Delta_y;
+
+    if Delta_y > 0
+        idx_10 = find(y >= y_10, 1, 'first');
+        idx_90 = find(y >= y_90, 1, 'first');
+    else
+        idx_10 = find(y <= y_10, 1, 'first');
+        idx_90 = find(y <= y_90, 1, 'first');
+    end
+
+    if isempty(idx_10) || isempty(idx_90)
+        Tr_10_90 = NaN;
+    else
+        Tr_10_90 = t(idx_90) - t(idx_10);
+    end
+
+    if Delta_y > 0
+        pico = max(y);
+        Mp = max(0, (pico - yss_teorico) / abs(Delta_y) * 100);
+    else
+        pico = min(y);
+        Mp = max(0, (yss_teorico - pico) / abs(Delta_y) * 100);
+    end
+
+    essp = abs(yss_teorico - yss_sim);
+end
