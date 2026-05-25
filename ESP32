@@ -1,0 +1,881 @@
+/*
+ * =========================================================
+ *  TUBO DE VIENTO — CONTROLADORES DISCRETOS
+ *  ESP32 (Arduino Framework)
+ *  Ts = 20 ms (50 Hz)
+ *
+ *  LOGICA IMPLEMENTADA:
+ *  - Los controladores entregan PWM absoluto [%].
+ *  - Se trabaja alrededor del punto de operación:
+ *        PWM_BASE = 28.65 %
+ *  - El PWM durante control activo se limita a:
+ *        PWM_MIN = 15 %, PWM_MAX = 100 %
+ *
+ *  CONTROLADORES:
+ *  ctrl 1 -> Proporcional P
+ *  ctrl 2 -> PI
+ *  ctrl 3 -> PID
+ *  ctrl 4 -> Adelanto Lead
+ *  ctrl 5 -> Atraso Lag
+ *  ctrl 6 -> Realimentación de estados
+ *
+ *  IMPORTANTE:
+ *  - La planta identificada era incremental:
+ *        G(z) = Delta altura / Delta PWM
+ *  - En implementación física mandamos PWM absoluto.
+ *  - Por eso cada controlador usa:
+ *        PWM = PWM_BASE + corrección
+ * =========================================================
+ */
+
+#include <HardwareSerial.h>
+#include <math.h>
+
+// ============================================================
+//  HARDWARE
+// ============================================================
+#define ESC_PIN      23
+#define PWM_FREQ     50
+#define PWM_RES      16
+#define MAIX_RX_PIN  16
+#define MAIX_TX_PIN  17
+#define PWM_FULLSCALE 65535UL
+
+HardwareSerial MaixSerial(2);
+
+// ============================================================
+//  PARAMETROS GLOBALES
+// ============================================================
+#define Ts_ms    20
+#define Ts_s     0.020f
+
+#define CM_MIN   0.0f
+#define CM_MAX   100.0f
+
+// Límites físicos del PWM durante control activo
+#define PWM_MIN   15.0f
+#define PWM_MAX   100.0f
+
+// Punto de operación usado en la identificación
+#define PWM_BASE  28.65f
+
+// Escalón real usado en identificación: 28.65 -> 28.69
+#define DELTA_PWM_REAL  0.04f
+
+// Ganancia DC de la planta identificada:
+// Gz original = 0.4418 / (z - 0.9942)
+// Kdc = 0.4418 / (1 - 0.9942) ≈ 76.1724 cm / PWM
+#define KDC_PLANTA  76.1724138f
+
+// ============================================================
+//  ESTADO DEL SISTEMA
+// ============================================================
+enum ControllerType {
+  CTRL_NONE    = 0,
+  CTRL_P       = 1,
+  CTRL_PI      = 2,
+  CTRL_PID     = 3,
+  CTRL_LEAD    = 4,
+  CTRL_LAG     = 5,
+  CTRL_ESTADOS = 6
+};
+
+ControllerType ctrl_activo = CTRL_P;
+
+bool  control_activo = false;
+
+float setpoint_cm = 50.0f;
+float posicion_cm = -1.0f;
+float pwm_output  = 0.0f;
+
+// Altura base alrededor de la cual se aplica la linealización.
+// Se captura al hacer start o con el comando "base".
+float altura_base_cm = 0.0f;
+bool  base_valida    = false;
+
+// ============================================================
+//  FUNCIONES AUXILIARES DE PWM
+// ============================================================
+
+float saturarPWM(float pwm_cmd) {
+  return constrain(pwm_cmd, PWM_MIN, PWM_MAX);
+}
+
+float deltaDesdePWM(float pwm_abs) {
+  return pwm_abs - PWM_BASE;
+}
+
+float pwmDesdeDelta(float delta_pwm) {
+  return PWM_BASE + delta_pwm;
+}
+
+// Feedforward generalizado.
+// Si el setpoint está r_delta cm por encima de la altura base,
+// el Delta PWM aproximado necesario es r_delta / KDC_PLANTA.
+// Para el escalón de identificación:
+// r_delta ≈ KDC_PLANTA*0.04 -> u_ff ≈ 0.04
+float calcularFeedforwardDelta() {
+  if (!base_valida) {
+    return DELTA_PWM_REAL;
+  }
+
+  float r_delta = setpoint_cm - altura_base_cm;
+  float u_ff = r_delta / KDC_PLANTA;
+
+  float du_min = PWM_MIN - PWM_BASE;
+  float du_max = PWM_MAX - PWM_BASE;
+
+  return constrain(u_ff, du_min, du_max);
+}
+
+void capturarBaseOperacion() {
+  if (posicion_cm >= CM_MIN && posicion_cm <= CM_MAX) {
+    altura_base_cm = posicion_cm;
+    base_valida = true;
+    Serial.printf(">>> Base capturada: altura_base = %.2f cm | PWM_BASE = %.2f %%\n",
+                  altura_base_cm, PWM_BASE);
+  } else {
+    Serial.println(">>> No se pudo capturar base: posicion invalida");
+  }
+}
+
+// ============================================================
+//  CONTROLADOR PROPORCIONAL P
+// ============================================================
+// Valores de simulación:
+// Kp_P = 1.35
+//
+// Forma física:
+// PWM = PWM_BASE + Kp_P*e
+//
+// donde:
+// e = setpoint_cm - posicion_cm
+
+struct PController {
+  float Kp = 1.35f;
+
+  void init()  { }
+  void reset() { }
+
+  float compute(float e) {
+    float pwm_unsat = PWM_BASE + Kp * e;
+    float pwm_sat = saturarPWM(pwm_unsat);
+    return pwm_sat;
+  }
+} P_ctrl;
+
+// ============================================================
+//  PI POSICIONAL CON BACK-CALCULATION
+// ============================================================
+// Valores de simulación:
+// Kp_pi = 0.10
+// Ki_pi = 0.02
+//
+// Forma física:
+// PWM = PWM_BASE + Kp*e + Ki*integral
+
+struct PIController {
+  float Kp       = 0.10f;
+  float Ki       = 0.02f;
+  float integral = 0.0f;
+
+  void init()  { integral = 0.0f; }
+  void reset() { integral = 0.0f; }
+
+  float compute(float e) {
+    float integral_candidate = integral + e * Ts_s;
+
+    float pwm_unsat = PWM_BASE + Kp * e + Ki * integral_candidate;
+
+    float pwm_sat = saturarPWM(pwm_unsat);
+
+    // Back-calculation anti-windup
+    if (fabsf(Ki) > 1e-9f) {
+      integral = integral_candidate + (pwm_sat - pwm_unsat) / Ki;
+    } else {
+      integral = integral_candidate;
+    }
+
+    return pwm_sat;
+  }
+} PI_ctrl;
+
+// ============================================================
+//  PID POSICIONAL CON FILTRO DERIVATIVO Y BACK-CALCULATION
+// ============================================================
+// Valores de simulación:
+// Kp_pid = 0.50
+// Ki_pid = 0.05
+// Kd_pid = 0.0015
+//
+// Forma física:
+// PWM = PWM_BASE + Kp*e + Ki*integral + Kd*derivada_filtrada
+
+struct PIDController {
+  float Kp       = 0.50f;
+  float Ki       = 0.05f;
+  float Kd       = 0.0015f;
+  float tau_f    = 0.05f;
+
+  float integral = 0.0f;
+  float e_prev   = 0.0f;
+  float d_filt   = 0.0f;
+
+  void init()  { integral = 0.0f; e_prev = 0.0f; d_filt = 0.0f; }
+  void reset() { integral = 0.0f; e_prev = 0.0f; d_filt = 0.0f; }
+
+  float compute(float e) {
+    // Derivada filtrada
+    float deriv_raw = (e - e_prev) / Ts_s;
+    float alpha = tau_f / (tau_f + Ts_s);
+
+    d_filt = alpha * d_filt + (1.0f - alpha) * deriv_raw;
+    e_prev = e;
+
+    float integral_candidate = integral + e * Ts_s;
+
+    float pwm_unsat = PWM_BASE
+                    + Kp * e
+                    + Ki * integral_candidate
+                    + Kd * d_filt;
+
+    float pwm_sat = saturarPWM(pwm_unsat);
+
+    // Back-calculation anti-windup
+    if (fabsf(Ki) > 1e-9f) {
+      integral = integral_candidate + (pwm_sat - pwm_unsat) / Ki;
+    } else {
+      integral = integral_candidate;
+    }
+
+    return pwm_sat;
+  }
+} PID_ctrl;
+
+// ============================================================
+//  COMPENSADOR DE ADELANTO LEAD
+// ============================================================
+// Valores de simulación:
+// a1_lead = 0.20
+// b0_lead = 0.50
+// b1_lead = -0.20
+//
+// Forma:
+// v[k] = a1*v[k-1] + b0*e[k] + b1*e[k-1]
+//
+// PWM = PWM_BASE + u_ff + v[k]
+//
+// donde u_ff es el feedforward equivalente al setpoint.
+// Para el escalón de identificación, u_ff ≈ 0.04.
+
+struct LeadController {
+  float a1 =  0.20f;
+  float b0 =  0.50f;
+  float b1 = -0.20f;
+
+  float e_prev = 0.0f;
+  float v_prev = 0.0f;
+
+  void init()  { e_prev = 0.0f; v_prev = 0.0f; }
+  void reset() { e_prev = 0.0f; v_prev = 0.0f; }
+
+  float compute(float e, float u_ff_delta) {
+    float v_cmd = a1 * v_prev + b0 * e + b1 * e_prev;
+
+    float pwm_unsat = PWM_BASE + u_ff_delta + v_cmd;
+
+    float pwm_sat = saturarPWM(pwm_unsat);
+
+    // Guardar la corrección realmente aplicada,
+    // descontando PWM_BASE y feedforward.
+    float delta_real = pwm_sat - PWM_BASE;
+    v_prev = delta_real - u_ff_delta;
+
+    e_prev = e;
+
+    return pwm_sat;
+  }
+} Lead_ctrl;
+
+// ============================================================
+//  COMPENSADOR DE ATRASO LAG
+// ============================================================
+// Valores de simulación:
+// a1_lag = 0.98
+// b0_lag = 0.15
+// b1_lag = -0.145
+//
+// Forma:
+// v[k] = a1*v[k-1] + b0*e[k] + b1*e[k-1]
+//
+// PWM = PWM_BASE + u_ff + v[k]
+
+struct LagController {
+  float a1 =  0.98f;
+  float b0 =  0.15f;
+  float b1 = -0.145f;
+
+  float e_prev = 0.0f;
+  float v_prev = 0.0f;
+
+  void init()  { e_prev = 0.0f; v_prev = 0.0f; }
+  void reset() { e_prev = 0.0f; v_prev = 0.0f; }
+
+  float compute(float e, float u_ff_delta) {
+    float v_cmd = a1 * v_prev + b0 * e + b1 * e_prev;
+
+    float pwm_unsat = PWM_BASE + u_ff_delta + v_cmd;
+
+    float pwm_sat = saturarPWM(pwm_unsat);
+
+    float delta_real = pwm_sat - PWM_BASE;
+    v_prev = delta_real - u_ff_delta;
+
+    e_prev = e;
+
+    return pwm_sat;
+  }
+} Lag_ctrl;
+
+// ============================================================
+//  REALIMENTACIÓN DE ESTADOS CON INTEGRADOR
+// ============================================================
+// Planta equivalente para Tm = 0.02:
+// A_p ≈ 0.99709578
+// B_p ≈ 0.22122124
+//
+// Polos deseados usados en simulación:
+// [0.75, 0.80]
+//
+// Ganancias calculadas:
+// Kx    ≈ 2.02103464
+// Ki_sf ≈ 11.30090416
+//
+// Modelo:
+// x_delta = posicion_cm - altura_base_cm
+// xi[k] = xi[k-1] + Ts*e[k]
+//
+// PWM = PWM_BASE - Kx*x_delta + Ki_sf*xi
+
+struct StateFeedbackController {
+  float Kx    = 2.0210346f;
+  float Ki_sf = 11.300904f;
+
+  float xi = 0.0f;
+
+  void init()  { xi = 0.0f; }
+  void reset() { xi = 0.0f; }
+
+  float compute(float e, float x_delta) {
+    float xi_candidate = xi + Ts_s * e;
+
+    float pwm_unsat = PWM_BASE - Kx * x_delta + Ki_sf * xi_candidate;
+
+    float pwm_sat = saturarPWM(pwm_unsat);
+
+    // Anti-windup por back-calculation sobre el integrador
+    if (fabsf(Ki_sf) > 1e-9f) {
+      xi = (pwm_sat - PWM_BASE + Kx * x_delta) / Ki_sf;
+    } else {
+      xi = xi_candidate;
+    }
+
+    return pwm_sat;
+  }
+} State_ctrl;
+
+// ============================================================
+//  RECEPCION UART
+// ============================================================
+
+char     buffer_maix[16];
+int      indice_maix = 0;
+
+uint32_t ultimo_tiempo_uart = 0;
+uint32_t delta_uart_ms      = 0;
+uint32_t ultimo_control_ms  = 0;
+
+String cmd_pc = "";
+
+// ============================================================
+//  ESTADISTICAS UART
+// ============================================================
+
+uint32_t uart_samples_count     = 0;
+uint32_t uart_delta_sum_ms      = 0;
+uint32_t uart_delta_min_ms      = UINT32_MAX;
+uint32_t uart_delta_max_ms      = 0;
+uint32_t ultimo_reporte_uart_ms = 0;
+
+bool primer_dato_uart_visto = false;
+
+const uint32_t REPORTE_UART_MS = 1000;
+
+// ============================================================
+//  ESC: rango físico 0-100%
+// ============================================================
+// Durante control activo se aplica PWM_MIN/PWM_MAX.
+// Fuera de control, escribirPulso permite manual 0-100.
+
+void escribirPulso(float pct) {
+  pwm_output = constrain(pct, 0.0f, 100.0f);
+
+  int us = (int)(1000.0f + (1000.0f * pwm_output / 100.0f));
+
+  uint32_t duty = (uint32_t)((uint64_t)us * PWM_FULLSCALE / 20000UL);
+
+  ledcWrite(ESC_PIN, duty);
+}
+
+// ============================================================
+//  RESET / STOP
+// ============================================================
+
+void resetControllers() {
+  P_ctrl.reset();
+  PI_ctrl.reset();
+  PID_ctrl.reset();
+  Lead_ctrl.reset();
+  Lag_ctrl.reset();
+  State_ctrl.reset();
+}
+
+void stopInmediato() {
+  control_activo = false;
+  escribirPulso(0.0f);
+  resetControllers();
+}
+
+// ============================================================
+//  CONTROL PRINCIPAL
+// ============================================================
+
+void ejecutarControl() {
+  if (!control_activo) {
+    escribirPulso(0.0f);
+    return;
+  }
+
+  if (posicion_cm < 0.0f) {
+    return;
+  }
+
+  // Si todavía no hay base, capturar una automáticamente.
+  if (!base_valida) {
+    capturarBaseOperacion();
+  }
+
+  float e = setpoint_cm - posicion_cm;
+
+  // Estado delta respecto a la altura base de operación.
+  float x_delta = 0.0f;
+  if (base_valida) {
+    x_delta = posicion_cm - altura_base_cm;
+  }
+
+  // Feedforward para Lead/Lag.
+  float u_ff_delta = calcularFeedforwardDelta();
+
+  float pwm_cmd = PWM_BASE;
+
+  switch (ctrl_activo) {
+    case CTRL_P:
+      pwm_cmd = P_ctrl.compute(e);
+      break;
+
+    case CTRL_PI:
+      pwm_cmd = PI_ctrl.compute(e);
+      break;
+
+    case CTRL_PID:
+      pwm_cmd = PID_ctrl.compute(e);
+      break;
+
+    case CTRL_LEAD:
+      pwm_cmd = Lead_ctrl.compute(e, u_ff_delta);
+      break;
+
+    case CTRL_LAG:
+      pwm_cmd = Lag_ctrl.compute(e, u_ff_delta);
+      break;
+
+    case CTRL_ESTADOS:
+      pwm_cmd = State_ctrl.compute(e, x_delta);
+      break;
+
+    default:
+      return;
+  }
+
+  // Doble seguridad
+  float pwm_sat = constrain(pwm_cmd, PWM_MIN, PWM_MAX);
+
+  escribirPulso(pwm_sat);
+
+  Serial.printf("%u,%.2f,%.2f,%.2f,%.2f,%d,%.2f,%.4f\n",
+                millis(),
+                setpoint_cm,
+                posicion_cm,
+                e,
+                pwm_sat,
+                (int)ctrl_activo,
+                base_valida ? altura_base_cm : -1.0f,
+                u_ff_delta);
+}
+
+// ============================================================
+//  LECTURA UART DESDE MAIXCAM
+// ============================================================
+
+void leerUARTMaix() {
+  int max_chars = 64;
+
+  while (MaixSerial.available() > 0 && max_chars-- > 0) {
+    char c = MaixSerial.read();
+
+    if (c == '\n') {
+      if (indice_maix > 0) {
+        buffer_maix[indice_maix] = '\0';
+
+        float nueva_pos = atof(buffer_maix);
+
+        uint32_t ahora = millis();
+        delta_uart_ms = ahora - ultimo_tiempo_uart;
+        ultimo_tiempo_uart = ahora;
+
+        if (primer_dato_uart_visto) {
+          uart_samples_count++;
+          uart_delta_sum_ms += delta_uart_ms;
+
+          if (delta_uart_ms < uart_delta_min_ms) uart_delta_min_ms = delta_uart_ms;
+          if (delta_uart_ms > uart_delta_max_ms) uart_delta_max_ms = delta_uart_ms;
+        } else {
+          primer_dato_uart_visto = true;
+        }
+
+        if (nueva_pos >= CM_MIN && nueva_pos <= CM_MAX) {
+          posicion_cm = nueva_pos;
+        }
+
+        indice_maix = 0;
+      }
+    }
+    else if (c != '\r' && indice_maix < 15) {
+      buffer_maix[indice_maix++] = c;
+    }
+  }
+}
+
+// ============================================================
+//  REPORTE FRECUENCIA UART
+// ============================================================
+
+void reportarUART() {
+  uint32_t now = millis();
+
+  if ((now - ultimo_reporte_uart_ms) < REPORTE_UART_MS) {
+    return;
+  }
+
+  ultimo_reporte_uart_ms = now;
+
+  if (uart_samples_count > 0) {
+    float promedio_ms = (float)uart_delta_sum_ms / uart_samples_count;
+    float frecuencia  = 1000.0f / promedio_ms;
+
+    Serial.printf("[UART] n=%lu, avg=%.1fms, min=%lums, max=%lums, ~%.1fHz\n",
+                  (unsigned long)uart_samples_count,
+                  promedio_ms,
+                  (unsigned long)uart_delta_min_ms,
+                  (unsigned long)uart_delta_max_ms,
+                  frecuencia);
+  } else {
+    Serial.println("[UART] sin muestras en el ultimo segundo");
+  }
+
+  uart_samples_count = 0;
+  uart_delta_sum_ms  = 0;
+  uart_delta_min_ms  = UINT32_MAX;
+  uart_delta_max_ms  = 0;
+}
+
+// ============================================================
+//  COMANDOS PC
+// ============================================================
+
+void procesarComandosPC() {
+  while (Serial.available() > 0) {
+    char c = Serial.read();
+
+    if (c == '\n') {
+      cmd_pc.trim();
+
+      if (cmd_pc.length() == 0) {
+        cmd_pc = "";
+        return;
+      }
+
+      if (cmd_pc == "stop") {
+        stopInmediato();
+        Serial.println(">>> CONTROL DETENIDO");
+      }
+
+      else if (cmd_pc == "start") {
+        resetControllers();
+
+        if (posicion_cm >= CM_MIN && posicion_cm <= CM_MAX) {
+          capturarBaseOperacion();
+        } else {
+          base_valida = false;
+          Serial.println(">>> Advertencia: sin posicion valida; se capturara base al recibir dato");
+        }
+
+        control_activo = true;
+
+        Serial.println(">>> CONTROL ACTIVADO");
+        Serial.println("T_ms,SP_cm,Pos_cm,Error_cm,PWM_%,Ctrl,Base_cm,Uff_delta");
+      }
+
+      else if (cmd_pc == "base") {
+        capturarBaseOperacion();
+      }
+
+      else if (cmd_pc.startsWith("ctrl ")) {
+        int n = cmd_pc.substring(5).toInt();
+
+        if (n >= 1 && n <= 6) {
+          resetControllers();
+          ctrl_activo = (ControllerType)n;
+
+          const char* nombres[] = {
+            "",
+            "P",
+            "PI",
+            "PID",
+            "Adelanto",
+            "Atraso",
+            "Estados"
+          };
+
+          Serial.printf(">>> Controlador: %s\n", nombres[n]);
+        } else {
+          Serial.println(">>> Controlador invalido. Use ctrl 1..6");
+        }
+      }
+
+      else if (cmd_pc.startsWith("sp ")) {
+        float sp = cmd_pc.substring(3).toFloat();
+
+        if (sp >= CM_MIN && sp <= CM_MAX) {
+          setpoint_cm = sp;
+          Serial.printf(">>> Setpoint: %.2f cm\n", setpoint_cm);
+        } else {
+          Serial.println(">>> Setpoint fuera de rango");
+        }
+      }
+
+      else if (cmd_pc == "estado") {
+        const char* nombres[] = {
+          "Ninguno",
+          "PI",
+          "PID",
+          "Adelanto",
+          "Atraso",
+          "Estados"
+        };
+
+        Serial.printf("Ctrl=%s | SP=%.2f cm | Pos=%.2f cm | Error=%.2f cm | PWM=%.2f%% | Activo=%s\n",
+                      nombres[ctrl_activo],
+                      setpoint_cm,
+                      posicion_cm,
+                      setpoint_cm - posicion_cm,
+                      pwm_output,
+                      control_activo ? "SI" : "NO");
+
+        Serial.printf("Base valida=%s | Base_cm=%.2f | Uff_delta=%.5f | Ts_uart=%lu ms\n",
+                      base_valida ? "SI" : "NO",
+                      base_valida ? altura_base_cm : -1.0f,
+                      calcularFeedforwardDelta(),
+                      (unsigned long)delta_uart_ms);
+
+        Serial.printf("P:   Kp=%.5f\n", P_ctrl.Kp);
+
+        Serial.printf("PI:  Kp=%.5f Ki=%.5f integral=%.5f\n",
+                      PI_ctrl.Kp,
+                      PI_ctrl.Ki,
+                      PI_ctrl.integral);
+
+        Serial.printf("PID: Kp=%.5f Ki=%.5f Kd=%.6f integral=%.5f d_filt=%.5f\n",
+                      PID_ctrl.Kp,
+                      PID_ctrl.Ki,
+                      PID_ctrl.Kd,
+                      PID_ctrl.integral,
+                      PID_ctrl.d_filt);
+
+        Serial.printf("Lead: a1=%.5f b0=%.5f b1=%.5f\n",
+                      Lead_ctrl.a1,
+                      Lead_ctrl.b0,
+                      Lead_ctrl.b1);
+
+        Serial.printf("Lag:  a1=%.5f b0=%.5f b1=%.5f\n",
+                      Lag_ctrl.a1,
+                      Lag_ctrl.b0,
+                      Lag_ctrl.b1);
+
+        Serial.printf("Estados: Kx=%.5f Ki_sf=%.5f xi=%.5f\n",
+                      State_ctrl.Kx,
+                      State_ctrl.Ki_sf,
+                      State_ctrl.xi);
+      }
+
+      else if (cmd_pc.startsWith("kpp ")) {
+        float v = cmd_pc.substring(4).toFloat();
+
+        if (v >= 0.0f) {
+          P_ctrl.Kp = v;
+          Serial.printf(">>> Kp P = %.5f\n", v);
+        } else {
+          Serial.println(">>> Kp P invalido");
+        }
+      }
+
+      else if (cmd_pc.startsWith("kp ")) {
+        float v = cmd_pc.substring(3).toFloat();
+
+        PI_ctrl.Kp = v;
+        PID_ctrl.Kp = v;
+
+        Serial.printf(">>> Kp PI/PID = %.5f\n", v);
+      }
+
+      else if (cmd_pc.startsWith("ki ")) {
+        float v = cmd_pc.substring(3).toFloat();
+
+        PI_ctrl.Ki = v;
+        PID_ctrl.Ki = v;
+
+        Serial.printf(">>> Ki PI/PID = %.5f\n", v);
+      }
+
+      else if (cmd_pc.startsWith("kd ")) {
+        float v = cmd_pc.substring(3).toFloat();
+
+        PID_ctrl.Kd = v;
+
+        Serial.printf(">>> Kd PID = %.6f\n", v);
+      }
+
+      else if (!control_activo) {
+        if (cmd_pc == "+") {
+          escribirPulso(pwm_output + 0.10f);
+        }
+        else if (cmd_pc == "-") {
+          escribirPulso(pwm_output - 0.10f);
+        }
+        else if (cmd_pc == "++") {
+          escribirPulso(pwm_output + 0.50f);
+        }
+        else if (cmd_pc == "--") {
+          escribirPulso(pwm_output - 0.50f);
+        }
+        else if (cmd_pc.startsWith("s")) {
+          escribirPulso(cmd_pc.substring(1).toFloat());
+        }
+      }
+
+      else if (cmd_pc == "help") {
+        imprimirMenu();
+      }
+
+      cmd_pc = "";
+    }
+
+    else if (c != '\r') {
+      cmd_pc += c;
+    }
+  }
+}
+
+// ============================================================
+//  MENU
+// ============================================================
+
+void imprimirMenu() {
+  Serial.println("\n========================================");
+  Serial.println(" TUBO DE VIENTO - CONTROL POSICIONAL");
+  Serial.println("========================================");
+  Serial.println(" ctrl N   -> 1=P 2=PI 3=PID 4=Lead 5=Lag 6=Estados");
+  Serial.println(" sp XX.X  -> setpoint (0-100 cm)");
+  Serial.println(" base     -> capturar posicion actual como altura base");
+  Serial.println(" start    -> activar lazo cerrado");
+  Serial.println(" stop     -> detener motor inmediato");
+  Serial.println(" estado   -> info y ganancias");
+  Serial.println(" kpp     -> ajuste online P");
+  Serial.println(" kp/ki/kd -> ajuste online PI/PID");
+  Serial.println(" +/-/++/--/sXX -> manual (off)");
+  Serial.println("========================================");
+  Serial.printf(" Ts = %.3f s\n", Ts_s);
+  Serial.printf(" PWM_BASE = %.2f %%\n", PWM_BASE);
+  Serial.printf(" PWM_MIN/MAX en control = %.1f / %.1f %%\n", PWM_MIN, PWM_MAX);
+  Serial.printf(" Delta PWM real identificacion = %.4f\n", DELTA_PWM_REAL);
+  Serial.println(" P con PWM = PWM_BASE + Kp*error");
+  Serial.println(" PI/PID con PWM = PWM_BASE + accion");
+  Serial.println(" Lead/Lag con feedforward dinamico");
+  Serial.println(" Estados agregado como ctrl 6");
+  Serial.println(" [UART] reporte de frecuencia cada 1s");
+  Serial.println("========================================");
+}
+
+// ============================================================
+//  SETUP
+// ============================================================
+
+void setup() {
+  Serial.begin(115200);
+
+  MaixSerial.begin(115200, SERIAL_8N1, MAIX_RX_PIN, MAIX_TX_PIN);
+  MaixSerial.setRxBufferSize(256);
+
+  ledcAttach(ESC_PIN, PWM_FREQ, PWM_RES);
+
+  escribirPulso(0.0f);
+
+  P_ctrl.init();
+  PI_ctrl.init();
+  PID_ctrl.init();
+  Lead_ctrl.init();
+  Lag_ctrl.init();
+  State_ctrl.init();
+
+  delay(1000);
+
+  imprimirMenu();
+
+  uint32_t now = millis();
+
+  ultimo_tiempo_uart     = now;
+  ultimo_control_ms      = now;
+  ultimo_reporte_uart_ms = now;
+}
+
+// ============================================================
+//  LOOP
+// ============================================================
+
+void loop() {
+  procesarComandosPC();
+
+  leerUARTMaix();
+
+  uint32_t now = millis();
+
+  if ((now - ultimo_control_ms) >= Ts_ms) {
+    ultimo_control_ms = now;
+
+    if (control_activo) {
+      ejecutarControl();
+    }
+  }
+
+  reportarUART();
+}
